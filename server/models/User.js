@@ -1,12 +1,13 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
+const validator = require('validator');
+const { env } = require('../config/env');
+
+const SALT_WORK_FACTOR = env.NODE_ENV === 'production' ? 12 : 10;
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOCK_TIME = 15 * 60 * 1000; // 15 minutes
 
 const userSchema = new mongoose.Schema({
-  _id: {
-    type: mongoose.Schema.Types.ObjectId,
-    default: mongoose.Types.ObjectId, // Explicitly set default to ensure auto-generation
-    auto: true // Ensure Mongoose auto-generates _id
-  },
   email: {
     type: String,
     required: [true, 'Email is required'],
@@ -14,159 +15,203 @@ const userSchema = new mongoose.Schema({
     trim: true,
     lowercase: true,
     validate: {
-      validator: function(v) {
-        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v); // Basic email format validation
-      },
+      validator: v => validator.isEmail(v),
       message: props => `${props.value} is not a valid email address`
+    },
+    index: { 
+      unique: true,
+      collation: { locale: 'en', strength: 2 } // Case-insensitive index
     }
   },
   password: {
     type: String,
     required: [true, 'Password is required'],
-    minlength: [8, 'Password must be at least 8 characters long'] // Enforce minimum length
+    minlength: [12, 'Password must be at least 12 characters'],
+    validate: {
+      validator: function(v) {
+        return /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+])[A-Za-z\d!@#$%^&*()_+]{12,}$/.test(v);
+      },
+      message: 'Password must contain uppercase, lowercase, number, and special character'
+    },
+    select: false
   },
   name: {
     type: String,
-    required: [true, 'Name is required'], // Making name required to match client-side validation
-    trim: true
+    required: [true, 'Name is required'],
+    trim: true,
+    maxlength: [50, 'Name cannot exceed 50 characters'],
+    text: true // Enable text search
   },
   avatar: {
     type: String,
-    default: null
+    default: null,
+    validate: {
+      validator: v => validator.isURL(v, { protocols: ['http','https'], require_protocol: true }),
+      message: 'Avatar must be a valid URL'
+    }
   },
-  course: {
-    type: String,
-    default: null
-  },
-  interests: {
+  roles: {
     type: [String],
-    default: []
+    enum: ['user', 'moderator', 'admin'],
+    default: ['user']
   },
-  points: {
+  loginAttempts: {
     type: Number,
-    default: 0
+    default: 0,
+    select: false
   },
-  badges: {
-    type: [String],
-    default: []
-  },
-  refreshToken: {
-    type: String,
-    default: null
-  },
-  isVerified: {
-    type: Boolean,
-    default: false
-  },
-  isDisabled: {
-    type: Boolean,
-    default: false
-  },
-  isAdmin: {
-    type: Boolean,
-    default: false
-  },
-  lastLogin: {
+  lockUntil: {
     type: Date,
-    default: null
+    select: false
   },
-  createdAt: {
-    type: Date,
-    default: Date.now,
-    immutable: true // Prevent updates to createdAt
+  securityLogs: {
+    type: [{
+      type: {
+        type: String,
+        enum: ['password_change', 'login', 'logout', 'lock']
+      },
+      ipAddress: String,
+      userAgent: String,
+      timestamp: Date
+    }],
+    select: false
   },
-  updatedAt: {
-    type: Date,
-    default: Date.now
-  }
+  refreshTokens: [{
+    token: String,
+    deviceId: String,
+    userAgent: String,
+    ipAddress: String,
+    createdAt: Date
+  }]
 }, {
-  timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' }, // Use Mongoose timestamps for consistency
-  _id: true // Ensure _id is enabled (default, but explicit for clarity)
+  timestamps: true,
+  toJSON: {
+    virtuals: true,
+    transform: function(doc, ret) {
+      delete ret.password;
+      delete ret.refreshTokens;
+      delete ret.securityLogs;
+      delete ret.loginAttempts;
+      delete ret.lockUntil;
+      delete ret.__v;
+      delete ret._id;
+      ret.id = doc._id.toString();
+      return ret;
+    }
+  }
 });
 
-// Pre-save middleware for password hashing
+// Compound indexes
+userSchema.index({ email: 1, isActive: 1 }); // Common query filter
+userSchema.index({ createdAt: -1, points: -1 }); // Leaderboard queries
+userSchema.index({ 'refreshTokens.createdAt': 1 }); // Token cleanup
+
+// Virtual property for account lock status
+userSchema.virtual('isLocked').get(function() {
+  return this.lockUntil && this.lockUntil > Date.now();
+});
+
+// Password hashing with pre-save hook
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) return next();
   
   try {
-    const salt = await bcrypt.genSalt(10);
-    this.password = await bcrypt.hash(this.password, salt);
+    this.password = await this.hashPassword(this.password);
     next();
   } catch (error) {
     next(error);
   }
 });
 
-// Update updatedAt before saving (except for password changes, handled above)
-userSchema.pre('save', function(next) {
-  if (this.isModified() && !this.isModified('password')) {
-    this.updatedAt = new Date();
+// Hash password method
+userSchema.methods.hashPassword = async function(password) {
+  const salt = await bcrypt.genSalt(SALT_WORK_FACTOR);
+  return bcrypt.hash(password, salt);
+};
+
+// Password comparison with attack prevention
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  if (this.isLocked) {
+    const timeLeft = Math.ceil((this.lockUntil - Date.now()) / 1000);
+    throw new Error(`Account locked. Try again in ${timeLeft} seconds`);
+  }
+
+  const isMatch = await bcrypt.compare(candidatePassword, this.password);
+  
+  if (!isMatch) {
+    this.loginAttempts += 1;
+    if (this.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
+      this.lockUntil = Date.now() + LOCK_TIME;
+      this.securityLogs.push({
+        type: 'lock',
+        timestamp: new Date(),
+        ipAddress: this.securityLogs.slice(-1)[0]?.ipAddress,
+        userAgent: this.securityLogs.slice(-1)[0]?.userAgent
+      });
+    }
+    await this.save();
+    return false;
+  }
+
+  // Reset attempts on successful login
+  if (this.loginAttempts > 0 || this.lockUntil) {
+    this.loginAttempts = 0;
+    this.lockUntil = undefined;
+    await this.save();
+  }
+
+  return true;
+};
+
+// Session management methods
+userSchema.methods.createRefreshToken = function(deviceId, userAgent, ipAddress) {
+  const token = crypto.randomBytes(40).toString('hex');
+  this.refreshTokens.push({
+    token,
+    deviceId,
+    userAgent,
+    ipAddress,
+    createdAt: new Date()
+  });
+  return token;
+};
+
+userSchema.methods.rotateRefreshToken = function(oldToken) {
+  const existingToken = this.refreshTokens.find(t => t.token === oldToken);
+  if (!existingToken) return null;
+  
+  const newToken = crypto.randomBytes(40).toString('hex');
+  existingToken.token = newToken;
+  existingToken.createdAt = new Date();
+  return newToken;
+};
+
+// Security logging middleware
+userSchema.pre(/^(save|findOneAndUpdate)/, function(next) {
+  if (this.isModified('password')) {
+    this.securityLogs.push({
+      type: 'password_change',
+      timestamp: new Date(),
+      ipAddress: this.securityLogs.slice(-1)[0]?.ipAddress,
+      userAgent: this.securityLogs.slice(-1)[0]?.userAgent
+    });
   }
   next();
 });
 
-// Method to sanitize user object for JSON responses
-userSchema.methods.toJSON = function() {
-  const obj = this.toObject();
-  delete obj.password;
-  delete obj.refreshToken;
-  delete obj.__v;
-  return obj;
+// Query helpers
+userSchema.query.byEmail = function(email) {
+  return this.where({ email: email.toLowerCase() });
 };
 
-// Method to compare passwords
-userSchema.methods.comparePassword = async function(candidatePassword) {
-  return bcrypt.compare(candidatePassword, this.password);
+userSchema.query.active = function() {
+  return this.where({ isActive: true });
 };
 
-// Method to update last login time
-userSchema.methods.updateLastLogin = function() {
-  this.lastLogin = new Date();
-  return this.save();
+// Static methods
+userSchema.statics.generatePassword = async function() {
+  const password = crypto.randomBytes(12).toString('hex');
+  return await this.hashPassword(password);
 };
-
-// Method to add points
-userSchema.methods.addPoints = async function(points) {
-  if (typeof points !== 'number' || points < 0) {
-    throw new Error('Points must be a non-negative number');
-  }
-  this.points += points;
-  return this.save();
-};
-
-// Method to add a badge
-userSchema.methods.addBadge = async function(badge) {
-  if (typeof badge !== 'string' || !badge.trim()) {
-    throw new Error('Badge must be a non-empty string');
-  }
-  if (!this.badges.includes(badge)) {
-    this.badges.push(badge);
-    return this.save();
-  }
-  return this;
-};
-
-// Static method to find by email (case-insensitive)
-userSchema.statics.findByEmail = function(email) {
-  return this.findOne({ email: email.toLowerCase() });
-};
-
-// Indexes for performance
-userSchema.index({ email: 1 }); // Unique index on email (already implied by unique: true)
-userSchema.index({ points: -1 }); // Index for sorting by points (descending)
-userSchema.index({ createdAt: -1 }); // Index for sorting by creation date (descending)
-
-// Optional: Validate interests array elements
-userSchema.path('interests').validate({
-  validator: function(v) {
-    return v.every(item => typeof item === 'string' && item.trim().length > 0);
-  },
-  message: 'Interests must be non-empty strings'
-});
-
-// Post-save hook to log _id (for debugging)
-userSchema.post('save', function(doc) {
-  console.log(`User saved with _id: ${doc._id}`);
-});
 
 module.exports = mongoose.model('User', userSchema);

@@ -1,86 +1,102 @@
 const bcrypt = require('bcrypt');
+const { promisify } = require('util');
+const { logSecurityEvent } = require('../lib/security-logger');
+const { zxcvbn } = require('@zxcvbn-ts/core');
+const crypto = require('crypto');
 
-const SALT_ROUNDS = 12;
-const MIN_PASSWORD_LENGTH = 8;
+// Configuration
+const CONFIG = {
+  SALT_ROUNDS: process.env.PW_SALT_ROUNDS || 12,
+  MIN_LENGTH: process.env.PW_MIN_LENGTH || 14,
+  MAX_LENGTH: process.env.PW_MAX_LENGTH || 128,
+  ZXCVBN_THRESHOLD: 3
+};
 
-/**
- * Validates password strength
- * @param {string} password - The password to validate
- * @return {boolean} True if password meets requirements
- */
+// Password policy constants
+const COMMON_PASSWORDS = new Set(require('./breached-passwords.json').slice(0, 100000));
+
+// Promisify crypto random bytes
+const randomBytesAsync = promisify(crypto.randomBytes);
+
+// Secure password validation
 const isStrongPassword = (password) => {
-  if (!password || typeof password !== 'string') return false;
+  if (typeof password !== 'string') return false;
   
-  const hasMinLength = password.length >= MIN_PASSWORD_LENGTH;
-  const hasUpperCase = /[A-Z]/.test(password);
-  const hasLowerCase = /[a-z]/.test(password);
-  const hasNumbers = /\d/.test(password);
-  const hasSpecialChar = /[!@#$%^&*(),.?":{}|<>]/.test(password);
-  
-  return hasMinLength && hasUpperCase && hasLowerCase && hasNumbers && hasSpecialChar;
+  // Length checks
+  if (password.length < CONFIG.MIN_LENGTH || password.length > CONFIG.MAX_LENGTH) {
+    return false;
+  }
+
+  // Check against common passwords
+  if (COMMON_PASSWORDS.has(password.toLowerCase())) {
+    return false;
+  }
+
+  // ZXCVBN complexity check
+  const { score } = zxcvbn(password);
+  return score >= CONFIG.ZXCVBN_THRESHOLD;
 };
 
-/**
- * Hashes the password using bcrypt algorithm
- * @param {string} password - The password to hash
- * @return {Promise<string>} Password hash
- * @throws {Error} If password is invalid or hashing fails
- */
 const generatePasswordHash = async (password) => {
-  if (!password || typeof password !== 'string') {
-    throw new Error('Invalid password provided');
-  }
-
-  if (!isStrongPassword(password)) {
-    throw new Error('Password does not meet security requirements');
-  }
-
   try {
-    const salt = await bcrypt.genSalt(SALT_ROUNDS);
-    const hash = await bcrypt.hash(password, salt);
-    return hash;
+    if (!isStrongPassword(password)) {
+      throw new Error('INVALID_CREDENTIALS');
+    }
+
+    // Generate cryptographically secure random buffer
+    const randomBuffer = await randomBytesAsync(16);
+    
+    // Add pepper to password
+    const pepperedPassword = password + process.env.PASSWORD_PEPPER;
+    
+    const salt = await bcrypt.genSalt(Number(CONFIG.SALT_ROUNDS));
+    const hash = await bcrypt.hash(pepperedPassword, salt);
+    
+    // Store both hash and random buffer (split storage recommended)
+    return `${hash}|${randomBuffer.toString('hex')}`;
   } catch (error) {
-    console.error('Password hashing failed:', error);
-    throw new Error('Failed to secure password');
+    logSecurityEvent('PASSWORD_HASH_FAILURE', { error: error.message });
+    throw new Error('ACCOUNT_CREATION_FAILED');
   }
 };
 
-/**
- * Validates the password against the hash
- * @param {string} password - The password to verify
- * @param {string} hash - Password hash to verify against
- * @return {Promise<boolean>} True if the password matches the hash
- * @throws {Error} If inputs are invalid or comparison fails
- */
-const validatePassword = async (password, hash) => {
-  if (!password || !hash) {
-    throw new Error('Password and hash are required');
-  }
-
-  if (!isPasswordHash(hash)) {
-    throw new Error('Invalid password hash format');
-  }
-
+const validatePassword = async (password, storedHash) => {
   try {
-    const result = await bcrypt.compare(password, hash);
-    return result;
+    if (!password || !storedHash) {
+      throw new Error('MISSING_CREDENTIALS');
+    }
+
+    const [hash, randomBufferHex] = storedHash.split('|');
+    if (!hash || !randomBufferHex) {
+      throw new Error('INVALID_HASH_FORMAT');
+    }
+
+    // Validate hash structure
+    if (!/^\$2[aby]\$[\d]+\$[./A-Za-z0-9]{53}$/.test(hash)) {
+      throw new Error('INVALID_HASH_FORMAT');
+    }
+
+    // Add pepper and validate
+    const pepperedPassword = password + process.env.PASSWORD_PEPPER;
+    const isValid = await bcrypt.compare(pepperedPassword, hash);
+    
+    if (!isValid) {
+      logSecurityEvent('PASSWORD_MATCH_FAILURE');
+    }
+
+    return isValid;
   } catch (error) {
-    console.error('Password validation failed:', error);
-    throw new Error('Failed to verify password');
+    logSecurityEvent('PASSWORD_VALIDATION_ERROR', { error: error.message });
+    throw new Error('AUTHENTICATION_FAILED');
   }
 };
 
-/**
- * Checks that the hash has a valid format
- * @param {string} hash - Hash to check format for
- * @return {boolean} True if passed string seems like valid hash
- */
+// Advanced hash validation
 const isPasswordHash = (hash) => {
-  if (!hash || hash.length !== 60) return false;
   try {
-    bcrypt.getRounds(hash);
-    return true;
-  } catch {
+    const [bcryptHash] = hash.split('|');
+    return bcryptHash && bcrypt.getRounds(bcryptHash) >= CONFIG.SALT_ROUNDS;
+  } catch (error) {
     return false;
   }
 };
@@ -90,5 +106,5 @@ module.exports = {
   validatePassword,
   isPasswordHash,
   isStrongPassword,
-  MIN_PASSWORD_LENGTH
+  CONFIG
 };

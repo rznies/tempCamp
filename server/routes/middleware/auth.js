@@ -1,138 +1,197 @@
 const jwt = require('jsonwebtoken');
-const User = require('../../models/User');
-const UserService = require('../../services/userService.js');
-const { verifyAccessToken, extractTokenFromHeader } = require('../../utils/auth.js');
+const { createHash } = require('crypto');
+const { logger, securityLogger } = require('../../lib/logger');
+const { UserService } = require('../../services/userService');
+const { TokenBlocklist } = require('../../services/tokenService');
+const { ratelimiter } = require('../../lib/rateLimiter');
+const { createErrorResponse } = require('../../lib/errorHandler');
 
-/**
- * Middleware to require authenticated user
- * @param {Object} req - Express request object
- * @param {Object} res - Express response object
- * @param {Function} next - Express next function
- */
-const requireUser = async (req, res, next) => {
+// Security constants
+const TOKEN_ALGORITHM = 'HS256';
+const TOKEN_TYP = 'at+jwt';
+const REPLAY_WINDOW_MS = 5000; // 5-second replay protection window
+
+// Token verification with full validation
+const verifyToken = (token) => {
   try {
-    const token = extractTokenFromHeader(req.headers.authorization);
-    if (!token) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'Authentication required' 
-      });
-    }
-
-    const decoded = verifyAccessToken(token);
-    if (!decoded) {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Invalid or expired token' 
-      });
-    }
-
-    // Verify user still exists and is active
-    const user = await UserService.get(decoded.sub);
-    if (!user) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'User not found' 
-      });
-    }
-
-    if (user.isDisabled) {
-      return res.status(403).json({
-        success: false,
-        message: 'Account is disabled'
-      });
-    }
-
-    // Add user info to request object
-    req.user = decoded;
-    next();
-  } catch (error) {
-    console.error('Authentication error:', error);
-    return res.status(500).json({ 
-      success: false, 
-      message: 'Authentication failed' 
+    return jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, {
+      algorithms: [TOKEN_ALGORITHM],
+      issuer: process.env.JWT_ISSUER,
+      audience: process.env.JWT_AUDIENCE,
+      clockTolerance: 5, // 5-second grace period for clock skew
+      ignoreExpiration: false,
     });
+  } catch (error) {
+    logger.warn('Token verification failed', {
+      error: error.name,
+      stack: error.stack,
+    });
+    return null;
   }
 };
 
-/**
- * Middleware to require admin role
- * @param {Object} req - Express request object
- * @param {Object} res - Express response object
- * @param {Function} next - Express next function
- */
-const requireAdmin = async (req, res, next) => {
-  try {
-    // First run the requireUser middleware
-    await requireUser(req, res, async () => {
-      // Check if user has admin role
-      const user = await UserService.get(req.user.sub);
-      if (!user.isAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: 'Admin access required'
+// Security middleware pipeline
+const securityHeaders = (req, res, next) => {
+  res.set({
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Content-Security-Policy': "default-src 'self'"
+  });
+  next();
+};
+
+// Replay attack protection middleware
+const replayProtection = async (req, res, next) => {
+  const tokenHash = createHash('sha256')
+    .update(req.token)
+    .digest('hex');
+  
+  if (await TokenBlocklist.isBlocked(tokenHash)) {
+    securityLogger.warn('Replay attack detected', {
+      ip: req.ip,
+      tokenHash,
+    });
+    return res.status(409).json(
+      createErrorResponse('security_error', 'Request rejected')
+    );
+  }
+
+  await TokenBlocklist.addToTemporalCache(tokenHash, REPLAY_WINDOW_MS);
+  next();
+};
+
+// Main authentication middleware
+const authenticateUser = async (req, res, next) => {
+  await ratelimiter.authLimiter(req, res, async () => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader?.startsWith('Bearer ')) {
+        return res.status(401).json(
+          createErrorResponse('authentication_required', 'Bearer token missing')
+        );
+      }
+
+      req.token = authHeader.split(' ')[1];
+      req.tokenHash = createHash('sha256')
+        .update(req.token)
+        .digest('hex');
+
+      const decoded = verifyToken(req.token);
+      if (!decoded?.sub || decoded.typ !== TOKEN_TYP) {
+        return res.status(403).json(
+          createErrorResponse('invalid_token', 'Malformed token')
+        );
+      }
+
+      const user = await UserService.get(decoded.sub, {
+        include: ['sessions', 'roles']
+      });
+      if (!user || user.isDisabled) {
+        return res.status(403).json(
+          createErrorResponse('account_inactive', 'User account not active')
+        );
+      }
+
+      // Check token against user's active sessions
+      if (!user.sessions.some(s => s.jti === decoded.jti)) {
+        return res.status(403).json(
+          createErrorResponse('session_expired', 'Token not in active sessions')
+        );
+      }
+
+      // Attach security context to request
+      req.authContext = {
+        user: user.toSecurityContext(),
+        token: {
+          jti: decoded.jti,
+          scope: decoded.scope,
+          issuedAt: new Date(decoded.iat * 1000)
+        }
+      };
+
+      next();
+    } catch (error) {
+      securityLogger.error('Authentication process failed', {
+        error: error.stack,
+        tokenHash: req.tokenHash,
+      });
+      res.status(500).json(
+        createErrorResponse('authentication_failure', 'System error')
+      );
+    }
+  });
+};
+
+// Role-based access control
+const requireRoles = (roles = []) => {
+  return async (req, res, next) => {
+    try {
+      if (!req.authContext?.user.roles.some(r => roles.includes(r))) {
+        securityLogger.warn('Role access denied', {
+          required: roles,
+          actual: req.authContext.user.roles,
         });
+        return res.status(403).json(
+          createErrorResponse('authorization_denied', 'Insufficient permissions')
+        );
       }
       next();
-    });
-  } catch (error) {
-    console.error('Admin authorization error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Authorization failed'
-    });
-  }
+    } catch (error) {
+      securityLogger.error('Role check failed', {
+        error: error.stack,
+        userId: req.authContext?.user.id
+      });
+      res.status(500).json(
+        createErrorResponse('authorization_failure', 'System error')
+      );
+    }
+  };
 };
 
-/**
- * Optional middleware to attach user if token is present
- * @param {Object} req - Express request object
- * @param {Object} res - Express response object
- * @param {Function} next - Express next function
- */
+// Admin-specific middleware
+const requireAdmin = [
+  authenticateUser,
+  requireRoles(['admin']),
+  (req, res, next) => {
+    // Additional admin-specific checks
+    if (!req.authContext.user.mfaVerified) {
+      return res.status(403).json(
+        createErrorResponse('mfa_required', 'Admin access requires MFA')
+      );
+    }
+    next();
+  }
+];
+
+// Optional user attachment
 const attachUser = async (req, res, next) => {
   try {
-    const token = extractTokenFromHeader(req.headers.authorization);
-    if (token) {
-      const decoded = verifyAccessToken(token);
-      if (decoded) {
-        const user = await UserService.get(decoded.sub);
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      const decoded = verifyToken(token);
+      
+      if (decoded?.sub) {
+        const user = await UserService.getSafeProfile(decoded.sub);
         if (user && !user.isDisabled) {
-          req.user = decoded;
+          req.user = user;
+          req.authContext = { user };
         }
       }
     }
-    next();
   } catch (error) {
-    console.error('User attachment error:', error);
+    logger.debug('Optional auth failed', { error: error.message });
+  } finally {
     next();
   }
 };
 
-// This middleware checks for the presence of an access token in the Authorization header.
-function authenticateToken(req, res, next) {
-  // Get the token from the Authorization header in the format "Bearer <token>"
-  const authHeader = req.headers['authorization'];
-  const token = authHeader ? authHeader.split(' ')[1] : null;
-
-  if (!token) {
-    return res.status(401).json({ success: false, message: "No token provided" });
-  }
-
-  // Verify the token using your secret (ensure ACCESS_TOKEN_SECRET is set in your environment variables)
-  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(403).json({ success: false, message: "Invalid token" });
-    }
-    // Attach the decoded token (user payload) to the request object.
-    req.user = decoded;
-    next();
-  });
-}
-
 module.exports = {
-  requireUser,
+  securityHeaders,
+  replayProtection,
+  authenticateUser,
+  requireRoles,
   requireAdmin,
   attachUser,
-  authenticateToken
 };
