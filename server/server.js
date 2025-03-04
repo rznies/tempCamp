@@ -1,159 +1,117 @@
-// Load environment variables
-require('dotenv').config();
-const express = require("express");
-const session = require("express-session");
-const MongoStore = require('connect-mongo');
-const mongoose = require("mongoose");
-const cors = require("cors");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const basicRoutes = require("./routes/index");
-const authRoutes = require("./routes/authRoutes");
-const { connectDB } = require("./config/database");
-const path = require('path');
-const multer = require('multer');
-
-// Validate required environment variables
-const requiredEnvVars = ['DATABASE_URL', 'JWT_SECRET', 'NODE_ENV'];
-for (const envVar of requiredEnvVars) {
-  if (!process.env[envVar]) {
-    console.error(`Error: ${envVar} environment variable is required`);
-    process.exit(1);
-  }
-}
+import express from 'express';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
+import compression from 'compression';
+import cookieParser from 'cookie-parser';
+import hpp from 'hpp';
+import mongoSanitize from 'express-mongo-sanitize';
+import { NODE_ENV, PORT, MONGODB_URI, CLIENT_ORIGIN } from './config/env.js';
+import authRoutes from './routes/auth.js';
+import { errorHandler } from './middleware/error.js';
 
 const app = express();
-const port = process.env.PORT || 3000;
 
-// Security middleware
+// Security middleware pipeline
 app.use(helmet());
+app.use(cors({
+  origin: CLIENT_ORIGIN,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(mongoSanitize());
+app.use(hpp());
+app.use(cookieParser());
 
-// Rate limiting
-const limiter = rateLimit({
+// Rate limiting for API routes
+const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
-  message: { 
-    success: false, 
-    message: 'Too many requests, please try again later.' 
-  }
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests from this IP, please try again later'
 });
-app.use(limiter);
 
-// Pretty-print JSON responses in development
-if (process.env.NODE_ENV === 'development') {
-  app.set('json spaces', 2);
+// Request logging
+if (NODE_ENV === 'development') {
+  app.use(morgan('dev'));
+} else {
+  app.use(
+    morgan('combined', {
+      skip: (req, res) => res.statusCode < 400 || req.originalUrl === '/health'
+    })
+  );
 }
 
-// Strict routing for consistent URLs
-app.enable('strict routing');
-
-// Configure CORS
-const corsOptions = {
-  origin: process.env.NODE_ENV === 'production' 
-    ? 'https://your-production-domain.com' 
-    : ['http://localhost:5173', 'http://localhost:4173'],
-  credentials: true
-};
-app.use(cors(corsOptions));
-
-// Body parsing middleware
-app.use(express.json({ limit: '10kb' })); // Limit body size
+// Body parsing and security
+app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Session configuration
-app.use(session({
-  secret: process.env.JWT_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  store: MongoStore.create({
-    mongoUrl: process.env.DATABASE_URL,
-    touchAfter: 24 * 3600 // Only update session once per day
-  }),
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours
-    httpOnly: true
+// Application middleware
+app.use(compression());
+app.disable('x-powered-by');
+
+// Database connection
+mongoose.set('strictQuery', false);
+const connectDB = async () => {
+  try {
+    await mongoose.connect(MONGODB_URI);
+    console.log('📦 MongoDB Connected');
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
   }
-}));
+};
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
-  }
-});
-
-const upload = multer({ storage });
-
-// Routes
-app.use('/api', basicRoutes);
-app.use('/api/auth', authRoutes);
-app.use('/uploads', express.static('uploads'));
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Resource not found'
+// Health check endpoint
+const healthCheckRouter = express.Router();
+healthCheckRouter.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: Date.now()
   });
 });
+app.use(healthCheckRouter);
 
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  
-  // Don't leak error details in production
-  const message = process.env.NODE_ENV === 'production' 
-    ? 'Internal server error' 
-    : err.message;
+// Apply rate limiter to API routes
+app.use('/api', apiLimiter);
+app.use('/api/v1/auth', authRoutes);
 
-  res.status(err.status || 500).json({
-    success: false,
-    message
-  });
+// Error handling middleware
+app.use(errorHandler);
+
+// Start server with graceful shutdown
+const server = app.listen(PORT, async () => {
+  await connectDB();
+  console.log(`🚀 Server running in ${NODE_ENV} mode on port ${PORT}`);
 });
 
 // Graceful shutdown
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
-
-function gracefulShutdown() {
-  console.log('Received shutdown signal');
-  
-  // Close server
-  server.close(() => {
-    console.log('Server closed');
-    
-    // Close database connection
-    mongoose.connection.close(false, () => {
-      console.log('Database connection closed');
-      process.exit(0);
-    });
+const shutdown = async (signal) => {
+  console.log(`${signal} received: closing HTTP server`);
+  server.close(async () => {
+    console.log('HTTP server closed');
+    await mongoose.connection.close();
+    console.log('Database connection closed');
+    process.exit(0);
   });
-}
-
-// Start server
-const startServer = async () => {
-  try {
-    await connectDB();
-    
-    const server = app.listen(port, () => {
-      console.log(`Server running in ${process.env.NODE_ENV} mode on port ${port}`);
-    });
-
-    // Handle unhandled promise rejections
-    process.on('unhandledRejection', (err) => {
-      console.error('Unhandled Promise Rejection:', err);
-      gracefulShutdown();
-    });
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
 };
 
-startServer();
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  shutdown('uncaughtException');
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
+  shutdown('unhandledRejection');
+});
